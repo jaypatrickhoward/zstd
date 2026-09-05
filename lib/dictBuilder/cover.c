@@ -21,20 +21,8 @@
 /*-*************************************
 *  Dependencies
 ***************************************/
-/* qsort_r is an extension.
- *
- * Android NDK does not ship qsort_r().
- */
-#if (defined(__linux__) && !defined(__ANDROID__)) || defined(__CYGWIN__) || defined(__MSYS__)
-# ifndef _GNU_SOURCE
-#   define _GNU_SOURCE
-# endif
-#endif
-
-#define __STDC_WANT_LIB_EXT1__ 1 /* request C11 Annex K, which includes qsort_s() */
-
 #include <stdio.h>  /* fprintf */
-#include <stdlib.h> /* malloc, free, qsort_r */
+#include <stdlib.h> /* malloc, free */
 
 #include <string.h> /* memset */
 #include <time.h>   /* clock */
@@ -64,31 +52,6 @@
 */
 #define COVER_MAX_SAMPLES_SIZE (sizeof(size_t) == 8 ? ((unsigned)-1) : ((unsigned)1 GB))
 #define COVER_DEFAULT_SPLITPOINT 1.0
-
-/**
- * Select the qsort() variant used by cover
- */
-#define ZDICT_QSORT_MIN 0
-#define ZDICT_QSORT_C90 ZDICT_QSORT_MIN
-#define ZDICT_QSORT_GNU 1
-#define ZDICT_QSORT_APPLE 2
-#define ZDICT_QSORT_MSVC 3
-#define ZDICT_QSORT_C11 ZDICT_QSORT_MAX
-#define ZDICT_QSORT_MAX 4
-
-#ifndef ZDICT_QSORT
-# if defined(__APPLE__)
-#   define ZDICT_QSORT ZDICT_QSORT_APPLE /* uses qsort_r() with a different order for parameters */
-# elif (defined(__linux__) && !defined(__ANDROID__)) || defined(__CYGWIN__) || defined(__MSYS__)
-#   define ZDICT_QSORT ZDICT_QSORT_GNU /* uses qsort_r() */
-# elif defined(_WIN32) && defined(_MSC_VER)
-#   define ZDICT_QSORT ZDICT_QSORT_MSVC /* uses qsort_s() with a different order for parameters */
-# elif defined(STDC_LIB_EXT1) && (STDC_LIB_EXT1 > 0) /* C11 Annex K */
-#   define ZDICT_QSORT ZDICT_QSORT_C11 /* uses qsort_s() */
-# else
-#   define ZDICT_QSORT ZDICT_QSORT_C90 /* uses standard qsort() which is not re-entrant (requires global variable) */
-# endif
-#endif
 
 
 /*-*************************************
@@ -262,13 +225,9 @@ typedef struct {
   U32 *freqs;
   U32 *dmerAt;
   unsigned d;
+  U32 *radixCounts;   /* COVER_RADIX_BUCKETS entries, scratch for stableSort() */
   int displayLevel;
 } COVER_ctx_t;
-
-#if ZDICT_QSORT == ZDICT_QSORT_C90
-/* Use global context for non-reentrant sort functions */
-static COVER_ctx_t *g_coverCtx = NULL;
-#endif
 
 /*-*************************************
 *  Helper functions
@@ -309,68 +268,93 @@ static int COVER_cmp8(COVER_ctx_t *ctx, const void *lp, const void *rp) {
   return (lhs > rhs);
 }
 
-/**
- * Same as COVER_cmp() except ties are broken by pointer value
+/* Radix sort over the dmer, 16 bits (two bytes) per pass.
+ *
+ * `d` bytes are consumed low-address-first, so the last pass sorts on the
+ * highest-address byte pair: byte 0 of the dmer is the least significant.
+ * For d <= 8 that reproduces the ordering of COVER_cmp8(). The ordering of
+ * distinct dmers is not otherwise significant -- COVER_groupBy() only requires
+ * that equal dmers be adjacent, and nothing reads the order of the groups.
+ *
+ * What does matter is that positions within a dmer group come out ascending:
+ * COVER_group() counts distinct samples with a forward-only cursor and would
+ * undercount otherwise. An LSD radix sort is stable, and the input is the
+ * identity permutation, so that ordering falls out for free.
  */
-#if (ZDICT_QSORT == ZDICT_QSORT_MSVC) || (ZDICT_QSORT == ZDICT_QSORT_APPLE)
-static int WIN_CDECL COVER_strict_cmp(void* g_coverCtx, const void* lp, const void* rp) {
-#elif (ZDICT_QSORT == ZDICT_QSORT_GNU) || (ZDICT_QSORT == ZDICT_QSORT_C11)
-static int COVER_strict_cmp(const void *lp, const void *rp, void *g_coverCtx) {
-#else /* C90 fallback.*/
-static int COVER_strict_cmp(const void *lp, const void *rp) {
-#endif
-  int result = COVER_cmp((COVER_ctx_t*)g_coverCtx, lp, rp);
-  if (result == 0) {
-    result = lp < rp ? -1 : 1;
-  }
-  return result;
-}
-/**
- * Faster version for d <= 8.
- */
-#if (ZDICT_QSORT == ZDICT_QSORT_MSVC) || (ZDICT_QSORT == ZDICT_QSORT_APPLE)
-static int WIN_CDECL COVER_strict_cmp8(void* g_coverCtx, const void* lp, const void* rp) {
-#elif (ZDICT_QSORT == ZDICT_QSORT_GNU) || (ZDICT_QSORT == ZDICT_QSORT_C11)
-static int COVER_strict_cmp8(const void *lp, const void *rp, void *g_coverCtx) {
-#else /* C90 fallback.*/
-static int COVER_strict_cmp8(const void *lp, const void *rp) {
-#endif
-  int result = COVER_cmp8((COVER_ctx_t*)g_coverCtx, lp, rp);
-  if (result == 0) {
-    result = lp < rp ? -1 : 1;
-  }
-  return result;
+#define COVER_RADIX_DIGIT_BITS 16
+#define COVER_RADIX_BUCKETS (1U << COVER_RADIX_DIGIT_BITS)
+
+/* @return the two dmer bytes at `offset`, or the single byte when `offset` is
+ * the last one (reading past the dmer would run off the end of the samples). */
+static U32 COVER_radixDigit(const COVER_ctx_t *ctx, U32 index, unsigned offset)
+{
+    const BYTE *const dmer = ctx->samples + index + offset;
+    if (offset + 1 < ctx->d) {
+        return (U32)dmer[0] | ((U32)dmer[1] << 8);
+    }
+    return (U32)dmer[0];
 }
 
-/**
- * Abstract away divergence of qsort_r() parameters.
- * Hopefully when C11 become the norm, we will be able
- * to clean it up.
- */
+#if (DEBUGLEVEL>=1)
+/* The property COVER_group() depends on, asserted directly. */
+static int COVER_groupsAscendByPosition(COVER_ctx_t *ctx)
+{
+    size_t i;
+    for (i = 1; i < ctx->suffixSize; ++i) {
+        int const sameDmer = (ctx->d <= 8)
+            ? (COVER_cmp8(ctx, &ctx->suffix[i - 1], &ctx->suffix[i]) == 0)
+            : (COVER_cmp(ctx, &ctx->suffix[i - 1], &ctx->suffix[i]) == 0);
+        if (sameDmer && ctx->suffix[i - 1] >= ctx->suffix[i]) return 0;
+    }
+    return 1;
+}
+#endif
+
 static void stableSort(COVER_ctx_t *ctx)
 {
-    DEBUG_STATIC_ASSERT(ZDICT_QSORT_MIN <= ZDICT_QSORT && ZDICT_QSORT <= ZDICT_QSORT_MAX);
-#if (ZDICT_QSORT == ZDICT_QSORT_APPLE)
-    qsort_r(ctx->suffix, ctx->suffixSize, sizeof(U32),
-            ctx,
-            (ctx->d <= 8 ? &COVER_strict_cmp8 : &COVER_strict_cmp));
-#elif (ZDICT_QSORT == ZDICT_QSORT_GNU)
-    qsort_r(ctx->suffix, ctx->suffixSize, sizeof(U32),
-            (ctx->d <= 8 ? &COVER_strict_cmp8 : &COVER_strict_cmp),
-            ctx);
-#elif (ZDICT_QSORT == ZDICT_QSORT_MSVC)
-    qsort_s(ctx->suffix, ctx->suffixSize, sizeof(U32),
-            (ctx->d <= 8 ? &COVER_strict_cmp8 : &COVER_strict_cmp),
-            ctx);
-#elif (ZDICT_QSORT == ZDICT_QSORT_C11)
-    qsort_s(ctx->suffix, ctx->suffixSize, sizeof(U32),
-            (ctx->d <= 8 ? &COVER_strict_cmp8 : &COVER_strict_cmp),
-            ctx);
-#else /* C90 fallback.*/
-    g_coverCtx = ctx;
-    /* TODO(cavalcanti): implement a reentrant qsort() when _r is not available. */
-    qsort(ctx->suffix, ctx->suffixSize, sizeof(U32),
-          (ctx->d <= 8 ? &COVER_strict_cmp8 : &COVER_strict_cmp));
+    /* Scratch for the radix passes.
+     * ctx->dmerAt holds ctx->suffixSize entries, the same count as ctx->suffix,
+     * so it is exactly large enough for the permutation. It is not read until
+     * COVER_groupBy() runs after this returns, and that overwrites every entry.
+     * Safe only because ctx_init() completes before any worker is handed this
+     * ctx -- see ZDICT_optimizeTrainFromBuffer_cover(). */
+    U32 *src = ctx->suffix;
+    U32 *dst = ctx->dmerAt;
+    U32 *const counts = ctx->radixCounts;
+    size_t const n = ctx->suffixSize;
+    unsigned const nbPasses = (ctx->d + 1) / 2;
+    unsigned pass;
+
+    for (pass = 0; pass < nbPasses; ++pass) {
+        unsigned const offset = pass * 2;
+        size_t total = 0;
+        size_t i;
+        U32 bucket;
+
+        memset(counts, 0, COVER_RADIX_BUCKETS * sizeof(*counts));
+        for (i = 0; i < n; ++i) {
+            counts[COVER_radixDigit(ctx, src[i], offset)]++;
+        }
+        /* every dmer shares this digit : the pass would be a no-op */
+        if (n > 0 && counts[COVER_radixDigit(ctx, src[0], offset)] == n) continue;
+
+        for (bucket = 0; bucket < COVER_RADIX_BUCKETS; ++bucket) {
+            U32 const count = counts[bucket];
+            counts[bucket] = (U32)total;
+            total += count;
+        }
+        assert(total == n);   /* every element lands at a distinct index < n */
+        for (i = 0; i < n; ++i) {
+            dst[counts[COVER_radixDigit(ctx, src[i], offset)]++] = src[i];
+        }
+        {   U32 *const swap = src; src = dst; dst = swap; }
+    }
+
+    if (src != ctx->suffix) {
+        memcpy(ctx->suffix, src, n * sizeof(*ctx->suffix));
+    }
+#if (DEBUGLEVEL>=1)
+    assert(COVER_groupsAscendByPosition(ctx));
 #endif
 }
 
@@ -612,6 +596,10 @@ static void COVER_ctx_destroy(COVER_ctx_t *ctx) {
     free(ctx->dmerAt);
     ctx->dmerAt = NULL;
   }
+  if (ctx->radixCounts) {
+    free(ctx->radixCounts);
+    ctx->radixCounts = NULL;
+  }
   if (ctx->offsets) {
     free(ctx->offsets);
     ctx->offsets = NULL;
@@ -672,7 +660,9 @@ static size_t COVER_ctx_init(COVER_ctx_t *ctx, const void *samplesBuffer,
   ctx->dmerAt = (U32 *)malloc(ctx->suffixSize * sizeof(U32));
   /* The offsets of each file */
   ctx->offsets = (size_t *)malloc((nbSamples + 1) * sizeof(size_t));
-  if (!ctx->suffix || !ctx->dmerAt || !ctx->offsets) {
+  /* Bucket counts for stableSort(); per-context, so training stays reentrant */
+  ctx->radixCounts = (U32 *)malloc(COVER_RADIX_BUCKETS * sizeof(U32));
+  if (!ctx->suffix || !ctx->dmerAt || !ctx->offsets || !ctx->radixCounts) {
     DISPLAYLEVEL(1, "Failed to allocate scratch buffers\n");
     COVER_ctx_destroy(ctx);
     return ERROR(memory_allocation);
