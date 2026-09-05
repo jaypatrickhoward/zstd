@@ -1,0 +1,145 @@
+# Cross-platform dictionary REPRODUCIBILITY check for the COVER sort change.
+#
+# NOT part of the upstream PR. Lives on a fork branch that is never a PR head.
+#
+# Question: dev's stableSort() breaks ties on the ADDRESS of the elements being
+# sorted, so its output depends on the platform's qsort() implementation. Does
+# that make the produced dictionary differ between platforms? And does the
+# radix-sort patch make it identical everywhere?
+#
+# Method: generate a byte-identical corpus on every runner (explicit LCG, binary
+# writes -- never Python's random, whose internals have shifted between
+# versions), train with fixed parameters, print the SHA-256 of each dictionary.
+# Compare hashes ACROSS runners afterwards.
+#
+# macos-13 (x86_64) is deliberately excluded: that runner pool has never been
+# scheduled for this fork and starved two earlier benchmark runs.
+name: cover-dict-hash
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: 'baseline ref (unpatched)'
+        required: true
+        default: 'dev'
+      candidate:
+        description: 'candidate ref (patched)'
+        required: true
+        default: 'cover-radix-sort'
+  push:
+    branches: ['bench-hash']
+
+jobs:
+  dicthash:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    label: linux-x86_64,   windows: false }
+          - { os: ubuntu-24.04-arm, label: linux-arm64,    windows: false }
+          - { os: macos-latest,     label: macos-arm64,    windows: false }
+          - { os: windows-latest,   label: windows-x86_64, windows: true  }
+          - { os: windows-11-arm,   label: windows-arm64,  windows: true  }
+    steps:
+      - name: Checkout baseline
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.baseline || 'dev' }}
+          path: base
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.candidate || 'cover-radix-sort' }}
+          path: cand
+
+      - name: Build both (unix)
+        if: ${{ !matrix.windows }}
+        run: |
+          for d in base cand; do
+            make -C $d -j$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu) zstd
+          done
+          cp base/zstd zstd-base
+          cp cand/zstd zstd-cand
+
+      - name: Build both (windows / MSVC)
+        if: ${{ matrix.windows }}
+        shell: pwsh
+        run: |
+          foreach ($d in @('base','cand')) {
+            cmake -S "$d/build/cmake" -B "$d/bld" -DCMAKE_BUILD_TYPE=Release -DZSTD_BUILD_PROGRAMS=ON
+            cmake --build "$d/bld" --config Release --parallel
+          }
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe base/bld | Select-Object -First 1).FullName zstd-base.exe
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe cand/bld | Select-Object -First 1).FullName zstd-cand.exe
+
+      - name: Pin a consistent Python (best effort)
+        continue-on-error: true
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Resolve interpreter
+        shell: bash
+        run: |
+          for c in python3 python "py -3"; do
+            if $c -c "import sys" >/dev/null 2>&1; then echo "PY=$c" >> $GITHUB_ENV; exit 0; fi
+          done
+          echo "no python interpreter found" >&2; exit 1
+
+      - name: Hash dictionaries
+        shell: bash
+        env:
+          LABEL: ${{ matrix.label }}
+          IS_WIN: ${{ matrix.windows }}
+        run: |
+          cat > gen.py <<'PYEOF'
+          import os, sys
+          # Explicit 64-bit LCG. Byte-identical on every platform and Python build.
+          MASK = (1 << 64) - 1
+          state = 88172645463325252
+          def nxt():
+              global state
+              state = (state * 6364136223846793005 + 1442695040888963407) & MASK
+              return (state >> 33) & 0xFFFFFFFF
+          TOK = [b'alpha', b'bravo', b'charlie', b'delta', b'echo', b'foxtrot',
+                 b'golf', b'hotel', b'india', b'juliet', b'kilo', b'lima',
+                 b'{"id":', b'"name":', b'"ts":', b'"val":', b',', b'}', b'\n']
+          os.makedirs('corpus', exist_ok=True)
+          names = []
+          for i in range(400):
+              parts, n = [], 0
+              while n < 8192:
+                  t = TOK[nxt() % len(TOK)]
+                  parts.append(t); n += len(t)
+              data = b''.join(parts)[:8192]
+              p = os.path.join('corpus', 'f%04d.bin' % i)
+              with open(p, 'wb') as f: f.write(data)
+              names.append(p)
+          # filelist: LF only. zstd's --filelist splits on '\n' and does NOT
+          # strip '\r', so a CRLF list silently fails on Windows.
+          with open('flist.txt', 'wb') as f:
+              f.write(b'\n'.join(n.replace('\\', '/').encode() for n in sorted(names)) + b'\n')
+          import hashlib
+          h = hashlib.sha256()
+          for n in sorted(names):
+              with open(n, 'rb') as f: h.update(f.read())
+          print('CORPUS %s' % h.hexdigest())
+          PYEOF
+          $PY gen.py
+
+          EXT=""; [ "$IS_WIN" = "true" ] && EXT=".exe"
+          for D in 6 8 16; do
+            for REF in base cand; do
+              OUT="dict_${REF}_${D}.bin"
+              ./zstd-${REF}${EXT} --train-cover=k=200,d=${D} --filelist=flist.txt \
+                 --maxdict=16384 -o "$OUT" > train.log 2>&1 || { echo "TRAIN FAILED $REF d=$D"; cat train.log; exit 1; }
+              [ -s "$OUT" ] || { echo "EMPTY DICT $REF d=$D"; exit 1; }
+              H=$($PY -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$OUT")
+              SZ=$(wc -c < "$OUT" | tr -d ' ')
+              echo "DICTHASH $LABEL $REF d=$D size=$SZ $H"
+            done
+          done
