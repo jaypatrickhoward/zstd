@@ -1,0 +1,309 @@
+# Cross-platform benchmark for the COVER dictionary-builder sort.
+#
+# This file is intentionally NOT part of the upstream PR. Keep it on a branch
+# of your fork that is never used as a PR head (see README-bench.md).
+#
+# It builds two refs of zstd, trains a dictionary with --train-cover on an
+# identical generated corpus, and reports the ratio. Ratios are what matter:
+# GitHub runners are shared vCPUs, so absolute times are noisy, but the effect
+# being measured is large enough to survive that.
+name: cover-sort-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: 'baseline ref (unpatched)'
+        required: true
+        default: 'dev'
+      candidate:
+        description: 'candidate ref (patched)'
+        required: true
+        default: 'cover-radix-sort'
+      case_timeout:
+        description: 'seconds allowed for ONE training invocation before the case is skipped'
+        required: true
+        default: '300'
+      max_reps:
+        description: 'max alternating A/B pairs per case'
+        required: true
+        default: '9'
+      case_budget:
+        description: 'seconds of measured work per case before repetitions stop'
+        required: true
+        default: '300'
+      min_reps:
+        description: 'minimum A/B pairs per case, even if over budget'
+        required: true
+        default: '5'
+      case_hardcap:
+        description: 'absolute seconds ceiling per case, overrides min_reps'
+        required: true
+        default: '600'
+  # fallback trigger: workflow_dispatch only appears in the UI for workflows
+  # present on the default branch. Pushing to bench* always works.
+  push:
+    branches: ['bench*']
+
+jobs:
+  bench:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    label: linux-x86_64,   windows: false, max_mb: 64 }
+          - { os: ubuntu-24.04-arm, label: linux-arm64,    windows: false, max_mb: 64 }
+          - { os: macos-latest,     label: macos-arm64,    windows: false, max_mb: 64 }
+          - { os: macos-13,         label: macos-x86_64,   windows: false, max_mb: 64 }
+          # No per-platform cap: the per-case timeout below governs instead, so
+          # a pathological baseline (MSVC, issue #4185) is reported as a lower
+          # bound rather than silently excluded.
+          - { os: windows-latest,   label: windows-x86_64, windows: true,  max_mb: 64 }
+          - { os: windows-11-arm,   label: windows-arm64,  windows: true,  max_mb: 64 }
+    steps:
+      - name: Checkout baseline
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.baseline || 'dev' }}
+          path: base
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.candidate || 'cover-radix-sort' }}
+          path: cand
+
+      - name: Build both (unix)
+        if: ${{ !matrix.windows }}
+        run: |
+          for d in base cand; do
+            make -C $d -j$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu) zstd
+          done
+          cp base/zstd zstd-base
+          cp cand/zstd zstd-cand
+
+      # Windows/MSVC is the configuration issue #4185 reports as pathological,
+      # so build it the way that issue did rather than via mingw make.
+      - name: Build both (windows / MSVC)
+        if: ${{ matrix.windows }}
+        shell: pwsh
+        run: |
+          foreach ($d in @('base','cand')) {
+            cmake -S "$d/build/cmake" -B "$d/bld" -DCMAKE_BUILD_TYPE=Release -DZSTD_BUILD_PROGRAMS=ON
+            cmake --build "$d/bld" --config Release --parallel
+          }
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe base/bld | Select-Object -First 1).FullName zstd-base.exe
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe cand/bld | Select-Object -First 1).FullName zstd-cand.exe
+
+      # setup-python is best-effort: its coverage on the newer ARM64 images
+      # (notably windows-11-arm) is not guaranteed, so never let it fail the job.
+      - name: Pin a consistent Python (best effort)
+        continue-on-error: true
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Resolve an interpreter regardless of how we got one. Ubuntu images ship
+      # python3 but no `python`; Windows ships `py`; setup-python provides
+      # `python`. Fail loudly rather than silently skipping the measurement.
+      - name: Resolve a Python interpreter
+        shell: bash
+        run: |
+          for c in python3 python "py -3"; do
+            if $c -c 'import sys; sys.exit(0 if sys.version_info >= (3,6) else 1)' >/dev/null 2>&1; then
+              echo "PYBIN=$c" >> "$GITHUB_ENV"
+              echo "using: $c -> $($c -V 2>&1)"
+              exit 0
+            fi
+          done
+          echo "::error::no usable Python 3 found on this runner"
+          exit 1
+
+      - name: Generate corpus
+        shell: bash
+        run: |
+          $PYBIN - <<'PY'
+          import os, random
+          random.seed(20260905)                      # fixed: same corpus everywhere
+          mb = int(os.environ.get('MAX_MB','64'))
+          os.makedirs('corpus', exist_ok=True)
+          keys = ['user_id','session','path','referrer','agent','status','bytes','region','host','latency_ms']
+          vals = ['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet']
+          written = 0; i = 0
+          target = mb * 1024 * 1024
+          while written < target:
+              rows = []
+              for _ in range(random.randint(20, 60)):
+                  rec = {k: (random.choice(vals) if random.random() < .5 else random.randint(1, 99999))
+                         for k in random.sample(keys, 6)}
+                  rows.append('{' + ', '.join('"%s": "%s"' % (k, v) for k, v in rec.items()) + '}')
+              blob = '\n'.join(rows)
+              with open('corpus/s%06d.json' % i, 'w') as f: f.write(blob)
+              written += len(blob); i += 1
+          print('corpus: %d files, %.1f MB' % (i, written/1048576))
+          PY
+        env:
+          MAX_MB: ${{ matrix.max_mb }}
+
+      - name: Benchmark --train-cover
+        shell: bash
+        run: |
+          $PYBIN - <<'PY'
+          import glob, subprocess, time, os, sys, statistics
+          exe = os.environ.get('EXE_SUFFIX', '')
+          base, cand = './zstd-base'+exe, './zstd-cand'+exe
+          allf = sorted(glob.glob('corpus/*.json'))
+          maxmb = int(os.environ['MAX_MB'])
+
+          # files are ~equal size, so a prefix of the list is a smaller corpus
+          def subset(mb):
+              want = mb * 1024 * 1024
+              got, out = 0, []
+              for f in allf:
+                  out.append(f); got += os.path.getsize(f)
+                  if got >= want: break
+              return out
+
+          TIMEOUT = int(os.environ.get('CASE_TIMEOUT', '300'))
+          MAXREPS = int(os.environ.get('MAX_REPS', '9'))
+          BUDGET  = float(os.environ.get('CASE_BUDGET', '90'))
+          MINREPS = int(os.environ.get('MIN_REPS', '5'))
+          HARDCAP = float(os.environ.get('CASE_HARDCAP', '400'))
+
+          def one(exe_, cfg, listfile):
+              """One timed invocation. -> seconds, or None if it timed out.
+
+              A failed invocation MUST NOT be reported as a fast success: check the exit
+              status and that a plausible dictionary was produced, and abort loudly
+              otherwise. Silently timing a command that exits immediately yields
+              believable-looking numbers that are pure fiction.
+              """
+              if os.path.exists('out.dict'):
+                  os.remove('out.dict')
+              t0 = time.perf_counter()
+              try:
+                  p = subprocess.run([exe_, cfg, '--filelist', listfile, '-o', 'out.dict'],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     timeout=TIMEOUT)
+              except subprocess.TimeoutExpired:
+                  return None
+              dt = time.perf_counter() - t0
+              if p.returncode != 0:
+                  sys.stderr.write('FAILED rc=%d: %s %s --filelist %s\n'
+                                   % (p.returncode, exe_, cfg, listfile))
+                  sys.stderr.write(p.stderr.decode('utf-8', 'replace')[:2000] + '\n')
+                  raise SystemExit('benchmark invocation failed -- refusing to report a time')
+              if not os.path.exists('out.dict') or os.path.getsize('out.dict') < 1024:
+                  sys.stderr.write('no/implausible dictionary from: %s %s\n' % (exe_, cfg))
+                  sys.stderr.write(p.stderr.decode('utf-8', 'replace')[:2000] + '\n')
+                  raise SystemExit('benchmark produced no dictionary -- refusing to report a time')
+              return dt
+
+          def run_pair(cfg, listfile, maxreps, budget, minreps, hardcap):
+              """Interleave base and candidate, alternating which goes first, and take
+              the min of each.
+
+              Running all of one then all of the other lets slow drift on a shared runner
+              masquerade as signal -- that is what produced a 1.11x median on a dev-vs-dev
+              null run. Alternating makes both sides see the same contention, and always
+              swapping the order cancels any first/second (page-cache) advantage.
+
+              Repetitions are budget-bound rather than fixed, so cheap cases get many
+              samples -- raising the chance that some rep lands in a quiet window -- while
+              expensive cases still finish.
+              """
+              best = {'B': 1e9, 'C': 1e9}
+              timed_out = {'B': False, 'C': False}
+              exes = {'B': base, 'C': cand}
+              spent = 0.0
+              reps = 0
+              for i in range(maxreps):
+                  order = ('B', 'C') if (i % 2 == 0) else ('C', 'B')
+                  for who in order:
+                      dt = one(exes[who], cfg, listfile)
+                      if dt is None:
+                          timed_out[who] = True
+                      else:
+                          best[who] = min(best[who], dt)
+                          spent += dt
+                  reps += 1
+                  # One timeout is conclusive: the result is reported as a bound, and
+                  # further repetitions would each cost a full TIMEOUT for no new
+                  # information (9 x 300s = 45 min burned on a single case).
+                  if timed_out['B'] or timed_out['C']:
+                      break
+                  # Budget alone starves the expensive cases: at 64 MB one A/B pair can
+                  # cost more than the whole budget, leaving 2 samples for min() to work
+                  # with -- which is where the residual macOS noise showed up. Guarantee
+                  # MINREPS samples first, with HARDCAP as the absolute ceiling so a
+                  # pathologically slow platform still cannot run away.
+                  if reps >= minreps and spent >= budget:
+                      break
+                  if spent >= hardcap:
+                      break
+              return best['B'], timed_out['B'], best['C'], timed_out['C'], reps
+
+          def sweep(title, rows, stop_when_both_time_out=False):
+              print('\n== %s  (timeout %ds, %d-%d pairs, %.0fs budget, %.0fs cap) =='
+                    % (title, TIMEOUT, MINREPS, MAXREPS, BUDGET, HARDCAP), flush=True)
+              print('%-30s %7s %10s %10s %10s %5s'
+                    % ('case', 'MB', 'base s', 'cand s', 'speedup', 'reps'), flush=True)
+              rs = []
+              for label, cfg, mb in rows:
+                  # Windows caps a command line at ~32k chars (WinError 206), and a
+                  # 64 MB corpus is tens of thousands of paths. Hand zstd a list file
+                  # instead of expanding the samples into argv.
+                  files = subset(mb)
+                  listfile = 'samples-%dmb.txt' % mb
+                  # newline='\n': Python text mode would emit CRLF on Windows, and
+                  # zstd's --filelist parser splits on '\n' without stripping the
+                  # '\r', so every path would come back nonexistent.
+                  with open(listfile, 'w', newline='\n') as fh:
+                      fh.write('\n'.join(files) + '\n')
+                  b, b_to, n, n_to, reps = run_pair(cfg, listfile, MAXREPS, BUDGET, MINREPS, HARDCAP)
+                  if b_to and n_to:
+                      # neither side finished: nothing to learn here, and every larger
+                      # size is worse. Always printed -- never a silent omission.
+                      print('%-30s %7d %10s %10s %10s %5d'
+                            % (label, mb, '>%d' % TIMEOUT, '>%d' % TIMEOUT, 'SKIPPED', reps), flush=True)
+                      if stop_when_both_time_out:
+                          print('   (remaining larger sizes skipped on this runner)', flush=True)
+                          break
+                  elif b_to:
+                      # the informative case: baseline intractable, candidate fine.
+                      print('%-30s %7d %10s %10.2f %10s %5d'
+                            % (label, mb, '>%d' % TIMEOUT, n, '>%.1fx' % (TIMEOUT / n), reps), flush=True)
+                      rs.append(TIMEOUT / n)
+                  elif n_to:
+                      print('%-30s %7d %10.2f %10s %10s %5d'
+                            % (label, mb, b, '>%d' % TIMEOUT, 'REGRESSION!', reps), flush=True)
+                  else:
+                      rs.append(b / n)
+                      print('%-30s %7d %10.2f %10.2f %9.2fx %5d'
+                            % (label, mb, b, n, b / n, reps), flush=True)
+              print('median: %s' % ('%.2fx' % statistics.median(rs) if rs else 'n/a'), flush=True)
+              return rs
+
+          # 1. does the speedup hold as the corpus grows?
+          sizes = [mb for mb in (4, 8, 16, 32, 64) if mb <= maxmb]
+          sweep('corpus size sweep (k=200,d=8)',
+                [('--train-cover=k=200,d=8', '--train-cover=k=200,d=8', mb) for mb in sizes],
+                stop_when_both_time_out=True)
+
+          # 2. d sets the radix pass count: (d+1)/2 -> 3, 4, 8 passes.
+          #    The advantage should shrink as d grows.
+          mid = 16 if maxmb >= 16 else maxmb
+          sweep('d sweep (%d MB, passes = (d+1)/2)' % mid,
+                [('d=%d  (%d radix passes)' % (d, (d+1)//2),
+                  '--train-cover=k=200,d=%d' % d, mid) for d in (6, 8, 16)])
+          PY
+        env:
+          EXE_SUFFIX: ${{ matrix.windows && '.exe' || '' }}
+          MAX_MB: ${{ matrix.max_mb }}
+          CASE_TIMEOUT: ${{ github.event.inputs.case_timeout || '300' }}
+          MAX_REPS: ${{ github.event.inputs.max_reps || '9' }}
+          CASE_BUDGET: ${{ github.event.inputs.case_budget || '300' }}
+          MIN_REPS: ${{ github.event.inputs.min_reps || '5' }}
+          CASE_HARDCAP: ${{ github.event.inputs.case_hardcap || '600' }}
