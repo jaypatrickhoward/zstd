@@ -1,0 +1,113 @@
+# What is the MINIMAL set of conditions sufficient to trigger the pathological
+# COVER training time on MSVC? Purely observable inputs -- no assumptions about
+# any qsort() implementation.
+#
+# Axis A: duplicate density at FIXED d, so density is separated from d itself.
+#         random (near-unique dmers) vs json vs lowent (tiny alphabet).
+# Axis B: corpus size at fixed d and corpus type, to get the scaling exponent.
+# Both axes are run against dev (broken tie-break) and cover-cmp-fix.
+name: cover-conditions
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['bench-cond']
+
+jobs:
+  conditions:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, label: windows-x86_64, windows: true }
+          - { os: ubuntu-latest,  label: linux-x86_64,   windows: false }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: 'dev', path: base }
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-cmp-fix', path: fix }
+      - name: Build (unix)
+        if: ${{ !matrix.windows }}
+        run: |
+          for d in base fix; do make -C $d -j$(nproc) zstd; done
+          cp base/zstd z-base; cp fix/zstd z-fix
+      - name: Build (windows / MSVC)
+        if: ${{ matrix.windows }}
+        shell: pwsh
+        run: |
+          foreach ($d in @('base','fix')) {
+            cmake -S "$d/build/cmake" -B "$d/bld" -DCMAKE_BUILD_TYPE=Release -DZSTD_BUILD_PROGRAMS=ON
+            cmake --build "$d/bld" --config Release --parallel
+          }
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe base/bld | Select-Object -First 1).FullName z-base.exe
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe fix/bld  | Select-Object -First 1).FullName z-fix.exe
+      - name: Conditions matrix
+        shell: bash
+        env:
+          IS_WIN: ${{ matrix.windows }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          cat > gen.py <<'PYEOF'
+          import os, sys, collections
+          MASK=(1<<64)-1
+          def mk(kind, mb, out):
+              state=88172645463325252
+              def nxt():
+                  nonlocal state
+                  state=(state*6364136223846793005+1442695040888963407)&MASK
+                  return (state>>33)&0xFFFFFFFF
+              os.makedirs(out, exist_ok=True); names=[]
+              target=mb*1024*1024; per=4096; n=target//per
+              for i in range(n):
+                  if kind=='random':
+                      data=bytes((nxt()&0xff) for _ in range(per))
+                  elif kind=='lowent':
+                      A=b'ab'
+                      data=bytes(A[nxt()&1] for _ in range(per))
+                  else:
+                      TOK=[b'{"id":',b'"name":',b'"ts":',b'"val":',b'alpha',b'bravo',b',',b'}',b'\n']
+                      parts=[];m=0
+                      while m<per:
+                          t=TOK[nxt()%len(TOK)];parts.append(t);m+=len(t)
+                      data=b''.join(parts)[:per]
+                  p=os.path.join(out,'f%05d.bin'%i); open(p,'wb').write(data); names.append(p)
+              open(out+'.list','wb').write(b'\n'.join(x.encode() for x in sorted(names))+b'\n')
+              return names
+          kind, mb, out, d = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+          names=mk(kind, mb, out)
+          data=b''.join(open(x,'rb').read() for x in names[:400])
+          c=collections.Counter(bytes(data[i:i+d]) for i in range(len(data)-d))
+          tot=sum(c.values())
+          print("DENSITY kind=%s d=%d distinct=%d total=%d mean_group=%.1f max_group=%d"
+                % (kind, d, len(c), tot, tot/len(c), max(c.values())))
+          PYEOF
+
+          EXT=""; [ "$IS_WIN" = "true" ] && EXT=".exe"
+          run() { # binary listfile d label
+            local S E T
+            S=$(python3 -c "import time;print(repr(time.time()))")
+            if timeout 1200 ./z-$1${EXT} --train-cover=k=200,d=$3 --filelist=$2 \
+                 --maxdict=110000 -o /dev/null >/dev/null 2>&1; then
+              T=$(python3 -c "import time;print('%.1f' % (time.time()-$S))")
+              echo "COND $LABEL $4 $1 ${T}s"
+            else
+              echo "COND $LABEL $4 $1 >1200s TIMEOUT"
+            fi
+          }
+
+          echo "--- Axis A: duplicate density at FIXED d=8, fixed 8 MB ---"
+          for KIND in random json lowent; do
+            python3 gen.py $KIND 8 c_$KIND 8
+            for V in base fix; do run $V c_$KIND.list 8 "A/kind=$KIND/d=8/8MB"; done
+            rm -rf c_$KIND
+          done
+
+          echo "--- Axis B: corpus size, json, d=8 ---"
+          for MB in 2 4 8 16; do
+            python3 gen.py json $MB s_$MB 8 >/dev/null
+            for V in base fix; do run $V s_$MB.list 8 "B/json/d=8/${MB}MB"; done
+            rm -rf s_$MB
+          done
