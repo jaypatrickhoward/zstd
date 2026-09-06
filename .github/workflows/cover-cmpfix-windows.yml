@@ -1,0 +1,95 @@
+# Is MSVC's quadratic COVER sort caused by comparator INCONSISTENCY rather than
+# duplicate keys? dev's tie-break (lp < rp) never returns 0, so "many equal
+# keys" cannot be the mechanism -- but it is not a consistent order over values
+# either, which can wreck quicksort's partitioning.
+#
+# Three builds, same corpus: dev (broken), cover-cmp-fix (one-line: tie-break on
+# stored position), cover-radix-sort. If the one-line fix alone removes the
+# blowup, the PR's Windows framing has to change.
+name: cover-cmpfix-windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['bench-hash']
+
+jobs:
+  cmpfix:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, label: windows-x86_64, windows: true }
+          - { os: ubuntu-latest,  label: linux-x86_64,   windows: false }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: 'dev', path: base }
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-cmp-fix', path: fix }
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-radix-sort', path: rad }
+
+      - name: Build (unix)
+        if: ${{ !matrix.windows }}
+        run: |
+          for d in base fix rad; do make -C $d -j$(nproc) zstd; done
+          cp base/zstd z-base; cp fix/zstd z-fix; cp rad/zstd z-rad
+
+      - name: Build (windows / MSVC)
+        if: ${{ matrix.windows }}
+        shell: pwsh
+        run: |
+          foreach ($d in @('base','fix','rad')) {
+            cmake -S "$d/build/cmake" -B "$d/bld" -DCMAKE_BUILD_TYPE=Release -DZSTD_BUILD_PROGRAMS=ON
+            cmake --build "$d/bld" --config Release --parallel
+          }
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe base/bld | Select-Object -First 1).FullName z-base.exe
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe fix/bld  | Select-Object -First 1).FullName z-fix.exe
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe rad/bld  | Select-Object -First 1).FullName z-rad.exe
+
+      - name: Measure
+        shell: bash
+        env:
+          IS_WIN: ${{ matrix.windows }}
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          MASK=(1<<64)-1; state=88172645463325252
+          def nxt():
+              global state
+              state=(state*6364136223846793005+1442695040888963407)&MASK
+              return (state>>33)&0xFFFFFFFF
+          TOK=[b'{"id":',b'"name":',b'"ts":',b'"val":',b'alpha',b'bravo',b'charlie',b',',b'}',b'\n']
+          os.makedirs('corpus',exist_ok=True); names=[]
+          for i in range(4000):
+              parts=[];n=0
+              while n<4096:
+                  t=TOK[nxt()%len(TOK)];parts.append(t);n+=len(t)
+              p='corpus/f%05d.bin'%i
+              open(p,'wb').write(b''.join(parts)[:4096]); names.append(p)
+          open('flist.txt','wb').write(b'\n'.join(n.encode() for n in sorted(names))+b'\n')
+          print('corpus: %d files, %d MB' % (len(names), 4000*4096//1048576))
+          PYEOF
+
+          EXT=""; [ "$IS_WIN" = "true" ] && EXT=".exe"
+          TIMEOUT=600
+          for D in 6 8 16; do
+            for V in base fix rad; do
+              S=$(date +%s)
+              if timeout $TIMEOUT ./z-${V}${EXT} --train-cover=k=200,d=${D} --filelist=flist.txt \
+                   --maxdict=110000 -o d_${V}_${D}.dict >/dev/null 2>&1; then
+                E=$(date +%s); echo "TIME ${{ matrix.label }} d=$D $V $((E-S))s"
+              else
+                echo "TIME ${{ matrix.label }} d=$D $V >${TIMEOUT}s TIMEOUT"
+              fi
+            done
+            for V in fix rad; do
+              if [ -f d_${V}_${D}.dict ] && [ -f d_base_${D}.dict ]; then
+                A=$(sha256sum d_base_${D}.dict|cut -c1-16); B=$(sha256sum d_${V}_${D}.dict|cut -c1-16)
+                echo "HASH ${{ matrix.label }} d=$D base=$A $V=$B"
+              fi
+            done
+          done
