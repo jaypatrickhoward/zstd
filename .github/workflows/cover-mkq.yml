@@ -1,0 +1,167 @@
+# PR2 validation: multi-key quicksort vs (qsort + PR1 comparator).
+#
+# NOT part of any PR. Two claims, measured separately:
+#   correctness - dictionaries must be byte-identical, on every platform
+#   performance - sort-phase time only, from binaries built by the project's
+#                 own build system with its own release flags
+#
+# stableSort() is wrapped with a clock() hook by tools/instrument.sh, applied
+# identically to both refs so neither branch carries benchmark code.
+# QEMU targets run correctness only: emulation does not model caches, so its
+# timings would not mean anything.
+name: cover-mkq
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['bench-mkq']
+
+jobs:
+  native:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    label: linux-x86_64,   win: false }
+          - { os: ubuntu-24.04-arm, label: linux-arm64,    win: false }
+          - { os: macos-latest,     label: macos-arm64,    win: false }
+          - { os: macos-15-intel,   label: macos-x86_64,   win: false }
+          - { os: windows-latest,   label: windows-x86_64, win: true  }
+          - { os: windows-11-arm,   label: windows-arm64,  win: true  }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-cmp-fix', path: base }
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-mkq-sort', path: cand }
+      - uses: actions/checkout@v4
+        with: { ref: 'bench-mkq', path: tools }
+
+      - name: Instrument both refs
+        shell: bash
+        run: |
+          sh tools/tools/instrument.sh base
+          sh tools/tools/instrument.sh cand
+
+      - name: Build both (unix, project defaults)
+        if: ${{ !matrix.win }}
+        run: |
+          for d in base cand; do
+            make -C $d -j$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu) zstd
+          done
+          cp base/zstd zbase && cp cand/zstd zcand
+          echo "--- flags actually used ---"; make -C base -n zstd | grep -m1 -oE '\-O[0-9s]' || true
+
+      - name: Build both (windows, MSVC Release)
+        if: ${{ matrix.win }}
+        shell: pwsh
+        run: |
+          foreach ($d in @('base','cand')) {
+            cmake -S "$d/build/cmake" -B "$d/bld" -DCMAKE_BUILD_TYPE=Release -DZSTD_BUILD_PROGRAMS=ON
+            cmake --build "$d/bld" --config Release --parallel
+          }
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe base/bld | Select-Object -First 1).FullName zbase.exe
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe cand/bld | Select-Object -First 1).FullName zcand.exe
+
+      - name: Generate corpus
+        shell: bash
+        run: |
+          mkdir -p corpus
+          cc -O2 -o gencorpus tools/tools/gencorpus.c 2>/dev/null || gcc -O2 -o gencorpus tools/tools/gencorpus.c
+          ./gencorpus
+          echo "corpus files: $(ls corpus | wc -l)"
+
+      - name: Measure
+        shell: bash
+        env:
+          LABEL: ${{ matrix.label }}
+          IS_WIN: ${{ matrix.win }}
+        run: |
+          EXT=""; [ "$IS_WIN" = "true" ] && EXT=".exe"
+          FAILED=0
+          for MB in 1 4 8 12 16 32; do
+            for D in 6 8 12 16 32 1024 max; do
+              if [ "$D" = "max" ]; then DD=112640; K=112640; MAXD=112640; else DD=$D; K=2048; MAXD=16384; fi
+              if [ "$DD" -gt "$K" ]; then continue; fi
+              SB=""; SC_=""
+              for R in 1 2 3; do
+                TB=$(./zbase${EXT} --train-cover=k=$K,d=$DD --filelist=list_${MB}mb.txt \
+                       --maxdict=$MAXD -o db.dict 2>&1 >/dev/null | grep -m1 SORTTIME | awk '{print $2}')
+                TC=$(./zcand${EXT} --train-cover=k=$K,d=$DD --filelist=list_${MB}mb.txt \
+                       --maxdict=$MAXD -o dc.dict 2>&1 >/dev/null | grep -m1 SORTTIME | awk '{print $2}')
+                if [ -z "$TB" ] || [ -z "$TC" ]; then
+                  echo "FAIL $LABEL ${MB}MB d=$DD : no SORTTIME emitted"; FAILED=1; break
+                fi
+                SB="$SB $TB"; SC_="$SC_ $TC"
+              done
+              [ -z "$SB" ] && continue
+              HB=$(cksum db.dict | awk '{print $1"-"$2}')
+              HC=$(cksum dc.dict | awk '{print $1"-"$2}')
+              if [ "$HB" = "$HC" ]; then IDENT=IDENTICAL; else IDENT=DIFFER; FAILED=1; fi
+              MB_=$(echo $SB | tr ' ' '\n' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+              MC_=$(echo $SC_ | tr ' ' '\n' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
+              RATIO=$(awk -v b=$MB_ -v c=$MC_ 'BEGIN{ if (c>0) printf "%.3f", b/c; else print "0" }')
+              echo "RESULT $LABEL ${MB}MB d=$DD qsort=${MB_}ms mkq=${MC_}ms ratio=${RATIO} $IDENT"
+            done
+          done
+          echo "SUMMARY $LABEL failed=$FAILED"
+          exit $FAILED
+
+  qemu:
+    name: qemu-${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [
+          { name: ARM,     xcc_pkg: gcc-arm-linux-gnueabi,     xcc: arm-linux-gnueabi-gcc,     xemu_pkg: qemu-user-static, xemu: qemu-arm-static     },
+          { name: ARM64,   xcc_pkg: gcc-aarch64-linux-gnu,     xcc: aarch64-linux-gnu-gcc,     xemu_pkg: qemu-user-static, xemu: qemu-aarch64-static },
+          { name: PPC,     xcc_pkg: gcc-powerpc-linux-gnu,     xcc: powerpc-linux-gnu-gcc,     xemu_pkg: qemu-user-static, xemu: qemu-ppc-static     },
+          { name: PPC64LE, xcc_pkg: gcc-powerpc64le-linux-gnu, xcc: powerpc64le-linux-gnu-gcc, xemu_pkg: qemu-user-static, xemu: qemu-ppc64le-static },
+          { name: S390X,   xcc_pkg: gcc-s390x-linux-gnu,       xcc: s390x-linux-gnu-gcc,       xemu_pkg: qemu-user-static, xemu: qemu-s390x-static   },
+          { name: MIPS,    xcc_pkg: gcc-mips-linux-gnu,        xcc: mips-linux-gnu-gcc,        xemu_pkg: qemu-user-static, xemu: qemu-mips-static    },
+          { name: RISCV,   xcc_pkg: gcc-14-riscv64-linux-gnu,  xcc: riscv64-linux-gnu-gcc-14,  xemu_pkg: qemu-user-static, xemu: qemu-riscv64-static },
+          { name: M68K,    xcc_pkg: gcc-m68k-linux-gnu,        xcc: m68k-linux-gnu-gcc,        xemu_pkg: qemu-user-static, xemu: qemu-m68k-static    },
+          { name: SPARC,   xcc_pkg: gcc-sparc64-linux-gnu,     xcc: sparc64-linux-gnu-gcc,     xemu_pkg: qemu-user-static, xemu: qemu-sparc64-static },
+        ]
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-cmp-fix', path: base }
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-mkq-sort', path: cand }
+      - uses: actions/checkout@v4
+        with: { ref: 'bench-mkq', path: tools }
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.xcc_pkg }} ${{ matrix.xemu_pkg }}
+      - name: Build both, statically linked
+        run: |
+          for d in base cand; do
+            LDFLAGS="-static" CC=${{ matrix.xcc }} make -C $d -j$(nproc) zstd
+          done
+          cp base/zstd zbase && cp cand/zstd zcand
+          ${{ matrix.xcc }} -O2 -static -o gencorpus tools/tools/gencorpus.c
+      - name: Correctness only (emulation cannot give meaningful timings)
+        run: |
+          mkdir -p corpus
+          ${{ matrix.xemu }} ./gencorpus
+          FAILED=0
+          for D in 6 8 9 16; do
+            ${{ matrix.xemu }} ./zbase --train-cover=k=2048,d=$D --filelist=list_1mb.txt \
+                --maxdict=16384 -o db.dict >/dev/null 2>&1 || { echo "FAIL base d=$D"; FAILED=1; continue; }
+            ${{ matrix.xemu }} ./zcand --train-cover=k=2048,d=$D --filelist=list_1mb.txt \
+                --maxdict=16384 -o dc.dict >/dev/null 2>&1 || { echo "FAIL cand d=$D"; FAILED=1; continue; }
+            HB=$(cksum db.dict | awk '{print $1"-"$2}')
+            HC=$(cksum dc.dict | awk '{print $1"-"$2}')
+            if [ "$HB" = "$HC" ]; then
+              echo "CORRECT ${{ matrix.name }} d=$D IDENTICAL $HB"
+            else
+              echo "CORRECT ${{ matrix.name }} d=$D DIFFER base=$HB cand=$HC"; FAILED=1
+            fi
+          done
+          echo "SUMMARY ${{ matrix.name }} failed=$FAILED"
+          exit $FAILED
