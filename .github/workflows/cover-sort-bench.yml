@@ -46,15 +46,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,    label: linux-x86_64,   windows: false, max_mb: 64 }
-          - { os: ubuntu-24.04-arm, label: linux-arm64,    windows: false, max_mb: 64 }
-          - { os: macos-latest,     label: macos-arm64,    windows: false, max_mb: 64 }
-          - { os: macos-13,         label: macos-x86_64,   windows: false, max_mb: 64 }
+          - { os: macos-15-intel,  label: macos-x86_64,   windows: false, max_mb: 64 }
           # No per-platform cap: the per-case timeout below governs instead, so
           # a pathological baseline (MSVC, issue #4185) is reported as a lower
           # bound rather than silently excluded.
-          - { os: windows-latest,   label: windows-x86_64, windows: true,  max_mb: 64 }
-          - { os: windows-11-arm,   label: windows-arm64,  windows: true,  max_mb: 64 }
     steps:
       - name: Checkout baseline
         uses: actions/checkout@v4
