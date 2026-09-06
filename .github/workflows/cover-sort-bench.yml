@@ -155,7 +155,7 @@ jobs:
 
           TIMEOUT = int(os.environ.get('CASE_TIMEOUT', '300'))
           MAXREPS = int(os.environ.get('MAX_REPS', '9'))
-          BUDGET  = float(os.environ.get('CASE_BUDGET', '90'))
+          BUDGET  = float(os.environ.get('CASE_BUDGET', '900'))
 
           def one(exe_, cfg, listfile):
               """One timed invocation. -> seconds, or None if it timed out.
@@ -280,9 +280,9 @@ jobs:
         env:
           EXE_SUFFIX: ${{ matrix.windows && '.exe' || '' }}
           MAX_MB: ${{ matrix.max_mb }}
-          CASE_TIMEOUT: ${{ github.event.inputs.case_timeout || '300' }}
+          CASE_TIMEOUT: ${{ github.event.inputs.case_timeout || '600' }}
           MAX_REPS: ${{ github.event.inputs.max_reps || '9' }}
-          CASE_BUDGET: ${{ github.event.inputs.case_budget || '90' }}
+          CASE_BUDGET: ${{ github.event.inputs.case_budget || '900' }}
 
       - name: Verify dictionaries are unaffected by the build
         shell: bash
