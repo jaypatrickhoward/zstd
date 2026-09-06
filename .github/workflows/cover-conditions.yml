@@ -105,6 +105,13 @@ jobs:
             rm -rf c_$KIND
           done
 
+          echo "--- Axis C: issue #4185 parameters (d=10) ---"
+          for MB in 8 16 32; do
+            python3 gen.py json $MB i_$MB 10 >/dev/null
+            for V in base fix; do run $V i_$MB.list 10 "C/issue4185/d=10/${MB}MB"; done
+            rm -rf i_$MB
+          done
+
           echo "--- Axis B: corpus size, json, d=8 ---"
           for MB in 2 4 8 16; do
             python3 gen.py json $MB s_$MB 8 >/dev/null
