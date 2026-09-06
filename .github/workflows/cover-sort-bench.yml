@@ -23,7 +23,7 @@ on:
       case_timeout:
         description: 'seconds allowed for ONE training invocation before the case is skipped'
         required: true
-        default: '300'
+        default: '600'
       max_reps:
         description: 'max alternating A/B pairs per case'
         required: true
@@ -31,7 +31,7 @@ on:
       case_budget:
         description: 'seconds of measured work per case before repetitions stop'
         required: true
-        default: '90'
+        default: '900'
   # fallback trigger: workflow_dispatch only appears in the UI for workflows
   # present on the default branch. Pushing to bench* always works.
   push:
@@ -41,7 +41,7 @@ jobs:
   bench:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
