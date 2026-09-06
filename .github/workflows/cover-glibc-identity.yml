@@ -1,0 +1,77 @@
+# Does glibc's qsort already produce the ordering the radix patch produces?
+#
+# NOT for upstream. If dev and cover-radix-sort emit byte-identical dictionaries
+# on glibc across a wide config sweep, then Linux users see NO dictionary change
+# at all, and a compression-ratio study on Linux would measure exactly zero.
+# Any divergence is the interesting case and tells us where to measure ratios.
+name: cover-glibc-identity
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['bench-hash']
+
+jobs:
+  identity:
+    name: glibc-identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: 'dev', path: base }
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-radix-sort', path: cand }
+      - name: Build both
+        run: |
+          for d in base cand; do make -C $d -j$(nproc) zstd; done
+          cp base/zstd zstd-base; cp cand/zstd zstd-cand
+          ldd --version | head -1
+      - name: Sweep
+        shell: bash
+        run: |
+          cat > gen.py <<'PYEOF'
+          import os, sys
+          MASK=(1<<64)-1; state=88172645463325252
+          def nxt():
+              global state
+              state=(state*6364136223846793005+1442695040888963407)&MASK
+              return (state>>33)&0xFFFFFFFF
+          kind, nfiles, fsize, out = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+          TOK={
+            'json':[b'{"id":',b'"name":',b'"ts":',b'"val":',b'alpha',b'bravo',b'charlie',b',',b'}',b'\n'],
+            'prose':[b'the ',b'and ',b'of ',b'to ',b'a ',b'in ',b'that ',b'it ',b'was ',b'. ',b'\n'],
+            'code':[b'static ',b'void ',b'const ',b'return ',b'if (',b') {',b'}\n',b'int ',b'i++',b';\n'],
+            'bin':None,
+            'lowent':[b'aaaa',b'aaab',b'aaba',b'abaa'],
+          }[kind]
+          os.makedirs(out, exist_ok=True); names=[]
+          for i in range(nfiles):
+              if TOK is None:
+                  data=bytes((nxt()&0xff) for _ in range(fsize))
+              else:
+                  parts=[];n=0
+                  while n<fsize:
+                      t=TOK[nxt()%len(TOK)];parts.append(t);n+=len(t)
+                  data=b''.join(parts)[:fsize]
+              p=os.path.join(out,'f%05d.bin'%i)
+              open(p,'wb').write(data);names.append(p)
+          open(out+'.list','wb').write(b'\n'.join(n.encode() for n in sorted(names))+b'\n')
+          PYEOF
+
+          FAIL=0; TOTAL=0; DIFF=0
+          for KIND in json prose code bin lowent; do
+            for SPEC in "200 4096" "800 8192" "2000 16384"; do
+              set -- $SPEC; NF=$1; FS=$2
+              python3 gen.py $KIND $NF $FS corp_${KIND}_${NF} >/dev/null
+              for CFG in "k=200,d=6" "k=200,d=8" "k=200,d=16" "k=1000,d=8" "k=64,d=6"; do
+                TOTAL=$((TOTAL+1))
+                ./zstd-base --train-cover=$CFG --filelist=corp_${KIND}_${NF}.list --maxdict=16384 -o b.dict >/dev/null 2>&1 || { echo "SKIP  $KIND $NF $CFG (base failed)"; continue; }
+                ./zstd-cand --train-cover=$CFG --filelist=corp_${KIND}_${NF}.list --maxdict=16384 -o c.dict >/dev/null 2>&1 || { echo "SKIP  $KIND $NF $CFG (cand failed)"; continue; }
+                HB=$(sha256sum b.dict|cut -c1-16); HC=$(sha256sum c.dict|cut -c1-16)
+                if [ "$HB" = "$HC" ]; then echo "SAME  $KIND nf=$NF fs=$FS $CFG $HB"
+                else echo "DIFFER $KIND nf=$NF fs=$FS $CFG base=$HB cand=$HC"; DIFF=$((DIFF+1)); fi
+              done
+              rm -rf corp_${KIND}_${NF} corp_${KIND}_${NF}.list
+            done
+          done
+          echo "SUMMARY total=$TOTAL differing=$DIFF"
