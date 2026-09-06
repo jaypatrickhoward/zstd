@@ -90,9 +90,7 @@ jobs:
                   TIMES="$TIMES TIMEOUT"; break
                 fi
               done
-              MED=$(python3 -c "
-v=[float(x) for x in '$TIMES'.split() if x!='TIMEOUT']
-print('%.2f' % sorted(v)[len(v)//2] if v else 'TIMEOUT')")
+              MED=$(python3 -c "v=[float(x) for x in '$TIMES'.split() if x!='TIMEOUT']; print('%.2f' % sorted(v)[len(v)//2] if v else 'TIMEOUT')")
               echo "RESULT ${{ matrix.label }} d=$D $V median=${MED}s n=$REPS raw=[$TIMES]"
             done
           done
