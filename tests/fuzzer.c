@@ -3666,7 +3666,7 @@ static int basicUnitTests(U32 const seed, double compressibility)
         DISPLAYLEVEL(3, "OK, created dictionary of size %u \n", (unsigned)dictSize);
 
         DISPLAYLEVEL(3, "test%3i : COVER dictBuilder orders equal dmers by position : ", testNb++);
-        /* COVER sorts its suffix array with qsort(), breaking ties between
+        /* COVER sorts its suffix array by dmer, breaking ties between
          * equal dmers by sample position; COVER_group() relies on that order
          * to count how many samples contain a dmer. A tie-break that depends on
          * the sort's internal state instead (the former address comparison)
