@@ -1,0 +1,69 @@
+# How large is PR 1's cost on glibc, and does it vary with corpus size?
+# Large corpora are where training time actually matters, so that is where the
+# cost must be characterised. Null control (identical binaries) on every size.
+name: cover-glibc-cost
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['bench-cond']
+
+jobs:
+  cost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: 'dev', path: base }
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-cmp-fix', path: fix }
+      - name: Build
+        run: |
+          for d in base fix; do make -C $d -j$(nproc) zstd; done
+          cp base/zstd z-base; cp base/zstd z-base2; cp fix/zstd z-fix
+          ldd --version | head -1
+      - name: Size sweep with null control
+        shell: bash
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          MASK=(1<<64)-1; state=88172645463325252
+          def nxt():
+              global state
+              state=(state*6364136223846793005+1442695040888963407)&MASK
+              return (state>>33)&0xFFFFFFFF
+          TOK=[b'{"id":',b'"name":',b'"ts":',b'"val":',b'alpha',b'bravo',b',',b'}',b'\n']
+          os.makedirs('corpus',exist_ok=True); names=[]
+          for i in range(16384):
+              parts=[];n=0
+              while n<4096:
+                  t=TOK[nxt()%len(TOK)];parts.append(t);n+=len(t)
+              p='corpus/f%05d.bin'%i; open(p,'wb').write(b''.join(parts)[:4096]); names.append(p)
+          names.sort()
+          for n,mb in ((1024,4),(2048,8),(4096,16),(8192,32),(16384,64)):
+              open('L%d.list'%mb,'wb').write(b'\n'.join(x.encode() for x in names[:n])+b'\n')
+          print('corpus built')
+          PYEOF
+          python3 - <<'PYEOF'
+          import subprocess, time, statistics as st
+          def run(b,lst):
+              t=time.time()
+              r=subprocess.run(['./'+b,'--train-cover=k=200,d=8','--filelist='+lst,
+                                '--maxdict=110000','-o','/tmp/s.dict'],capture_output=True)
+              return time.time()-t if r.returncode==0 else None
+          def pair(A,B,lst,reps):
+              a,b=[],[]
+              for i in range(reps):
+                  if i%2==0: x=run(A,lst); y=run(B,lst)
+                  else:      y=run(B,lst); x=run(A,lst)
+                  if x and y: a.append(x); b.append(y)
+              return st.median(a), st.median(b)
+          print("%6s %10s %10s %10s %10s %10s" % ("MB","null","dev","fix","dev/fix","cost%"))
+          for mb in (4,8,16,32,64):
+              lst='L%d.list'%mb
+              reps = 9 if mb<=16 else 7
+              na,nb = pair('z-base','z-base2',lst,reps)
+              da,fb = pair('z-base','z-fix',lst,reps)
+              print("%6d %9.4fx %9.3fs %9.3fs %9.4fx %+9.2f%%"
+                    % (mb, na/nb, da, fb, da/fb, (fb/da-1)*100), flush=True)
+          PYEOF
