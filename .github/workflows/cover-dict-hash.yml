@@ -12,8 +12,9 @@
 # versions), train with fixed parameters, print the SHA-256 of each dictionary.
 # Compare hashes ACROSS runners afterwards.
 #
-# macos-13 (x86_64) is deliberately excluded: that runner pool has never been
-# scheduled for this fork and starved two earlier benchmark runs.
+# macos-13 was RETIRED by GitHub on 2025-12-04 and no longer resolves to any
+# runner -- jobs requesting it queue forever rather than failing. The live
+# x86_64 label is macos-15-intel (free on public repos).
 name: cover-dict-hash
 
 on:
@@ -42,6 +43,7 @@ jobs:
           - { os: ubuntu-latest,    label: linux-x86_64,   windows: false }
           - { os: ubuntu-24.04-arm, label: linux-arm64,    windows: false }
           - { os: macos-latest,     label: macos-arm64,    windows: false }
+          - { os: macos-15-intel,  label: macos-x86_64,   windows: false }
           - { os: windows-latest,   label: windows-x86_64, windows: true  }
           - { os: windows-11-arm,   label: windows-arm64,  windows: true  }
     steps:
