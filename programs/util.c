@@ -730,6 +730,13 @@ static const char** UTIL_createLinePointers(char* buffer, size_t numLines, size_
             len++;
         }
 
+        /* Drop a trailing '\r' so lists written with Windows-native CRLF
+         * endings (e.g. `dir /b > list.txt`) resolve. The file is opened in
+         * binary mode, so the C runtime does not strip it for us. */
+        if (len > 0 && buffer[pos + len - 1] == '\r') {
+            buffer[pos + len - 1] = '\0';
+        }
+
         /* Move past this string and its null terminator */
         pos += len;
         if (pos < bufferSize) pos++;  /* Skip the null terminator if we're not at buffer end */

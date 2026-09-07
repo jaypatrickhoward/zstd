@@ -800,6 +800,13 @@ zstd -f --filelist=tmp_symLink
 test -f tmp2.zst
 test -f tmp1.zst
 
+println "test : file list with Windows CRLF line endings, --filelist=FILE"
+rm -f *.zst
+printf 'tmp1\r\ntmp2\r\n' > tmp_crlfList
+zstd -f --filelist=tmp_crlfList
+test -f tmp1.zst
+test -f tmp2.zst
+
 println "test : compress multiple files reading them from multiple files, --filelist=FILE"
 rm -f *.zst
 println "Hello world!, file3" > tmp3
