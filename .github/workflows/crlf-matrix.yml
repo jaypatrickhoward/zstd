@@ -36,9 +36,9 @@ jobs:
           echo "HEAD: $(git log -1 --oneline)"
           echo "fopen mode at this ref:"
           grep -o 'fopen(inputFileName, "[^"]*"' programs/util.c || \
-            grep -o 'fopen([A-Za-z]*, "r[b]*"' programs/util.c || echo "  (not found)"
-          echo "explicit CR handling at this ref:"
-          grep -c "'\\\\r'" programs/util.c
+            grep -o 'fopen([A-Za-z]*, "r[b]*"' programs/util.c || true
+          echo "explicit CR handling at this ref (0 = none):"
+          grep -c "'\\\\r'" programs/util.c || true
 
       - name: Build (MSVC x64 Release)
         run: msbuild "build\VS2010\zstd.sln" /m /verbosity:minimal /property:PlatformToolset=v142 /t:Clean,Build /p:Platform=x64 /p:Configuration=Release
