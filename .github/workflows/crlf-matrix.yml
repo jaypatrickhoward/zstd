@@ -1,0 +1,53 @@
+name: crlf-matrix
+on:
+  push:
+    branches: [ filelist-crlf-matrix ]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: ${{ matrix.variant }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: A-preregression
+            sha: 7f0519dcf
+          - variant: B-dev
+            sha: d9c0c7e2c
+          - variant: C-patched
+            sha: 592e461b3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: microsoft/setup-msbuild@v2
+
+      # Stash the probe outside the repo: switching refs would delete it.
+      - name: Stash probe script
+        shell: bash
+        run: cp tests/crlf-matrix-probe.sh "$RUNNER_TEMP/probe.sh"
+
+      - name: Check out variant ${{ matrix.variant }} (full tree)
+        shell: bash
+        run: |
+          git checkout --detach ${{ matrix.sha }}
+          echo "HEAD: $(git log -1 --oneline)"
+          echo "fopen mode at this ref:"
+          grep -o 'fopen(inputFileName, "[^"]*"' programs/util.c || \
+            grep -o 'fopen([A-Za-z]*, "r[b]*"' programs/util.c || echo "  (not found)"
+          echo "explicit CR handling at this ref:"
+          grep -c "'\\\\r'" programs/util.c
+
+      - name: Build (MSVC x64 Release)
+        run: msbuild "build\VS2010\zstd.sln" /m /verbosity:minimal /property:PlatformToolset=v142 /t:Clean,Build /p:Platform=x64 /p:Configuration=Release
+
+      - name: Probe both scenarios
+        shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          cp build/VS2010/bin/x64_Release/zstd.exe tests/
+          cd tests
+          ZSTD_BIN=./zstd.exe sh "$RUNNER_TEMP/probe.sh"
