@@ -16,8 +16,10 @@ jobs:
             sha: 7f0519dcf
           - variant: B-dev
             sha: d9c0c7e2c
-          - variant: C-patched
+          - variant: C-uncond-strip
             sha: 592e461b3
+          - variant: D-windows-only-strip
+            sha: 060ea1e54
     steps:
       - uses: actions/checkout@v4
         with:
