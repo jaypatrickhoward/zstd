@@ -34,7 +34,7 @@ jobs:
           cc -O3 -c lib/dictBuilder/cover.c -o cov.o -Ilib -Ilib/common -DDEBUGLEVEL=0
           echo "### ${{ matrix.label }}"
           if [ "$(uname)" = "Darwin" ]; then
-            otool -tV cov.o | awk '/_COVER_mkqSort:/{f=1} f{print; c++} c>16{exit}'
+            otool -tV cov.o | awk '/_COVER_mkqSort:/{f=1} f{print; c++} c>26{exit}'
           else
             objdump -d --disassemble=COVER_mkqSort cov.o | sed -n '1,22p'
           fi
@@ -51,6 +51,11 @@ jobs:
           Write-Host "listing: $($asm.FullName)"
           $lines = Get-Content $asm.FullName
           Write-Host "### ${{ matrix.label }}"
-          $i = ($lines | Select-String -Pattern '^COVER_mkqSort\s+PROC' | Select-Object -First 1).LineNumber
-          if (-not $i) { Write-Host "COVER_mkqSort PROC not found; searching sub rsp near symbol"; $lines | Select-String -Pattern 'COVER_mkqSort' | Select-Object -First 5 }
-          else { $lines[($i-1)..($i+24)] }
+          $i = ($lines | Select-String -Pattern '^\|?COVER_mkqSort\|?\s+PROC' | Select-Object -First 1).LineNumber
+          if (-not $i) {
+            Write-Host "PROC line not found; dumping every line mentioning the symbol:"
+            $lines | Select-String -Pattern 'COVER_mkqSort' | Select-Object -First 10
+          } else {
+            $end = [Math]::Min($i+34, $lines.Count-1)
+            $lines[($i-1)..$end]
+          }
