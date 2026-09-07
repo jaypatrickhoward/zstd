@@ -33,10 +33,10 @@ jobs:
         run: |
           cc -O3 -c lib/dictBuilder/cover.c -o cov.o -Ilib -Ilib/common -DDEBUGLEVEL=0
           echo "### ${{ matrix.label }}"
-          if command -v objdump >/dev/null 2>&1; then
-            objdump -d --disassemble=COVER_mkqSort cov.o | sed -n '1,20p'
+          if [ "$(uname)" = "Darwin" ]; then
+            otool -tV cov.o | awk '/_COVER_mkqSort:/{f=1} f{print; c++} c>16{exit}'
           else
-            otool -tV cov.o | awk '/_COVER_mkqSort:/{f=1} f{print; c++} c>14{exit}'
+            objdump -d --disassemble=COVER_mkqSort cov.o | sed -n '1,22p'
           fi
 
       - name: Frame size (MSVC)
@@ -45,10 +45,12 @@ jobs:
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
-          cmd /c "`"$vcvars`" ${{ matrix.arch }} && cl /nologo /c /O2 /FAs /Fa:cover.asm /I lib /I lib\common /DDEBUGLEVEL=0 lib\dictBuilder\cover.c /Fo:cover.obj"
-          if (-not (Test-Path cover.asm)) { Write-Error "no assembly listing produced"; exit 1 }
+          cmd /c "`"$vcvars`" ${{ matrix.arch }} && cl /nologo /c /O2 /FAs /I lib /I lib\common /DDEBUGLEVEL=0 lib\dictBuilder\cover.c"
+          $asm = Get-ChildItem -Recurse -Filter *.asm | Select-Object -First 1
+          if (-not $asm) { Write-Error "no assembly listing produced"; exit 1 }
+          Write-Host "listing: $($asm.FullName)"
+          $lines = Get-Content $asm.FullName
           Write-Host "### ${{ matrix.label }}"
-          $lines = Get-Content cover.asm
           $i = ($lines | Select-String -Pattern '^COVER_mkqSort\s+PROC' | Select-Object -First 1).LineNumber
           if (-not $i) { Write-Host "COVER_mkqSort PROC not found; searching sub rsp near symbol"; $lines | Select-String -Pattern 'COVER_mkqSort' | Select-Object -First 5 }
           else { $lines[($i-1)..($i+24)] }
