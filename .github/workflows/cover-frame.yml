@@ -1,0 +1,54 @@
+# Stack frame size of COVER_mkqSort per platform/ABI.
+# The frame is a static property of the compiled binary, so this reads the
+# prologue rather than running anything. Includes the platforms already
+# measured locally, to cross-check the method.
+name: cover-frame
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['bench-frame']
+
+jobs:
+  frame:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    label: gcc-linux-x86_64,  win: false }
+          - { os: ubuntu-24.04-arm, label: gcc-linux-arm64,   win: false }
+          - { os: macos-latest,     label: clang-macos-arm64, win: false }
+          - { os: macos-15-intel,   label: clang-macos-x86_64,win: false }
+          - { os: windows-latest,   label: msvc-x64,          win: true, arch: x64   }
+          - { os: windows-11-arm,   label: msvc-arm64,        win: true, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-mkq-sort' }
+
+      - name: Frame size (unix)
+        if: ${{ !matrix.win }}
+        run: |
+          cc -O3 -c lib/dictBuilder/cover.c -o cov.o -Ilib -Ilib/common -DDEBUGLEVEL=0
+          echo "### ${{ matrix.label }}"
+          if command -v objdump >/dev/null 2>&1; then
+            objdump -d --disassemble=COVER_mkqSort cov.o | sed -n '1,20p'
+          else
+            otool -tV cov.o | awk '/_COVER_mkqSort:/{f=1} f{print; c++} c>14{exit}'
+          fi
+
+      - name: Frame size (MSVC)
+        if: ${{ matrix.win }}
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
+          cmd /c "`"$vcvars`" ${{ matrix.arch }} && cl /nologo /c /O2 /FAs /Fa:cover.asm /I lib /I lib\common /DDEBUGLEVEL=0 lib\dictBuilder\cover.c /Fo:cover.obj"
+          if (-not (Test-Path cover.asm)) { Write-Error "no assembly listing produced"; exit 1 }
+          Write-Host "### ${{ matrix.label }}"
+          $lines = Get-Content cover.asm
+          $i = ($lines | Select-String -Pattern '^COVER_mkqSort\s+PROC' | Select-Object -First 1).LineNumber
+          if (-not $i) { Write-Host "COVER_mkqSort PROC not found; searching sub rsp near symbol"; $lines | Select-String -Pattern 'COVER_mkqSort' | Select-Object -First 5 }
+          else { $lines[($i-1)..($i+24)] }
