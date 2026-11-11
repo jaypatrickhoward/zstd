@@ -1,0 +1,198 @@
+# PR2 follow-up: END-TO-END training time, base (upstream dev) vs the
+# multi-key quicksort, plus three platforms the sort-phase grid did not cover:
+# musl (Alpine), FreeBSD and MinGW-w64.
+#
+# NOT part of any PR. Both refs get the same SORTTIME hook (tools/instrument.sh),
+# so each run reports whole-process wall time AND the sort's share of it.
+# Corpora: the synthetic generator used by cover-mkq.yml, and zstd's own
+# "github" regression dataset (500 small JSON records).
+#
+# Triggered by a push to bench-e2e only; push once, when ready.
+name: cover-e2e
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Job group to run (all, native, alpine, freebsd, mingw), to re-run one group without the rest'
+        default: 'all'
+  push:
+    branches: ['bench-e2e']
+
+concurrency:
+  group: cover-e2e
+  cancel-in-progress: true
+
+env:
+  GITHUB_DATA: https://github.com/facebook/zstd/releases/download/regression-data/github.tar.zst
+
+jobs:
+  native:
+    if: ${{ github.event_name == 'push' || inputs.only == 'all' || inputs.only == 'native' }}
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    label: linux-x86_64-glibc, win: false }
+          - { os: ubuntu-24.04-arm, label: linux-arm64-glibc,  win: false }
+          - { os: macos-latest,     label: macos-arm64,        win: false }
+          - { os: macos-15-intel,   label: macos-x86_64,       win: false }
+          - { os: windows-latest,   label: windows-x86_64-msvc, win: true }
+          - { os: windows-11-arm,   label: windows-arm64-msvc,  win: true }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: 'bench-base', path: base }
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-mkq-sort', path: cand }
+      - uses: actions/checkout@v4
+        with: { ref: 'bench-e2e', path: tools }
+      - name: Instrument both refs
+        shell: bash
+        run: |
+          sh tools/tools/instrument.sh base
+          sh tools/tools/instrument.sh cand
+      - name: Build both (unix, project defaults)
+        if: ${{ !matrix.win }}
+        run: |
+          for d in base cand; do
+            make -C $d -j$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu) zstd
+          done
+          cp base/zstd zbase && cp cand/zstd zcand
+      - name: Build both (windows, MSVC Release)
+        if: ${{ matrix.win }}
+        shell: pwsh
+        run: |
+          foreach ($d in @('base','cand')) {
+            cmake -S "$d/build/cmake" -B "$d/bld" -DCMAKE_BUILD_TYPE=Release -DZSTD_BUILD_PROGRAMS=ON
+            cmake --build "$d/bld" --config Release --parallel
+          }
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe base/bld | Select-Object -First 1).FullName zbase.exe
+          Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe cand/bld | Select-Object -First 1).FullName zcand.exe
+      - name: Corpora
+        shell: bash
+        run: |
+          mkdir -p gc/corpus data
+          cc -O2 -o gencorpus tools/tools/gencorpus.c 2>/dev/null || gcc -O2 -o gencorpus tools/tools/gencorpus.c
+          (cd gc && ../gencorpus > /dev/null && echo "synthetic files: $(ls corpus | wc -l)")
+          curl -sSfL -o data/github.tar.zst "$GITHUB_DATA"
+          EXT=""; [ "${{ matrix.win }}" = "true" ] && EXT=".exe"
+          ./zcand$EXT -dqf data/github.tar.zst -o data/github.tar
+          (cd data && tar -xf github.tar && echo "github files: $(find github -type f | wc -l)")
+      - name: Measure
+        shell: bash
+        run: |
+          EXT=""; [ "${{ matrix.win }}" = "true" ] && EXT=".exe"
+          PY=python3; [ "${{ matrix.win }}" = "true" ] && PY=python  # avoid the Store alias stub
+          $PY --version
+          $PY tools/tools/e2e.py ${{ matrix.label }} "$PWD/zbase$EXT" "$PWD/zcand$EXT" "$PWD/gc" "$PWD/data"
+
+  alpine:
+    if: ${{ github.event_name == 'push' || inputs.only == 'all' || inputs.only == 'alpine' }}
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     label: linux-x86_64-musl }
+          - { os: ubuntu-24.04-arm, label: linux-arm64-musl }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: 'bench-base', path: base }
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-mkq-sort', path: cand }
+      - uses: actions/checkout@v4
+        with: { ref: 'bench-e2e', path: tools }
+      - name: Build and measure in Alpine (musl)
+        run: |
+          docker run --rm -v "$PWD":/w -w /w -e GITHUB_DATA alpine:3.22 sh -euc '
+            apk add --no-cache build-base python3 curl tar > /dev/null
+            echo "musl: $(ldd 2>&1 | head -2 | tail -1)"
+            sh tools/tools/instrument.sh base
+            sh tools/tools/instrument.sh cand
+            for d in base cand; do make -C $d -j$(nproc) zstd > /dev/null; done
+            cp base/zstd zbase && cp cand/zstd zcand
+            mkdir -p gc/corpus data
+            cc -O2 -o gencorpus tools/tools/gencorpus.c
+            (cd gc && ../gencorpus > /dev/null)
+            curl -sSfL -o data/github.tar.zst "$GITHUB_DATA"
+            ./zcand -dqf data/github.tar.zst -o data/github.tar
+            (cd data && tar -xf github.tar)
+            python3 tools/tools/e2e.py '"${{ matrix.label }}"' /w/zbase /w/zcand /w/gc /w/data
+          '
+
+  freebsd:
+    if: ${{ github.event_name == 'push' || inputs.only == 'all' || inputs.only == 'freebsd' }}
+    name: freebsd-x86_64
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: 'bench-base', path: base }
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-mkq-sort', path: cand }
+      - uses: actions/checkout@v4
+        with: { ref: 'bench-e2e', path: tools }
+      - name: Build and measure in FreeBSD
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          release: "15"
+          sync: rsync
+          copyback: false
+          envs: 'GITHUB_DATA'
+          prepare: |
+            pkg install -y gmake python3 curl
+          run: |
+            set -eu
+            freebsd-version; sysctl -n hw.model hw.ncpu
+            sh tools/tools/instrument.sh base
+            sh tools/tools/instrument.sh cand
+            for d in base cand; do gmake -C $d -j$(sysctl -n hw.ncpu) zstd > /dev/null; done
+            cp base/zstd zbase && cp cand/zstd zcand
+            mkdir -p gc/corpus data
+            cc -O2 -o gencorpus tools/tools/gencorpus.c
+            (cd gc && ../gencorpus > /dev/null)
+            curl -sSfL -o data/github.tar.zst "$GITHUB_DATA"
+            ./zcand -dqf data/github.tar.zst -o data/github.tar
+            (cd data && tar -xf github.tar)
+            python3 tools/tools/e2e.py freebsd-x86_64 "$PWD/zbase" "$PWD/zcand" "$PWD/gc" "$PWD/data"
+
+  mingw:
+    if: ${{ github.event_name == 'push' || inputs.only == 'all' || inputs.only == 'mingw' }}
+    name: windows-x86_64-mingw
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: 'bench-base', path: base }
+      - uses: actions/checkout@v4
+        with: { ref: 'cover-mkq-sort', path: cand }
+      - uses: actions/checkout@v4
+        with: { ref: 'bench-e2e', path: tools }
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # tag=v2.32.0
+        with:
+          msystem: MINGW64
+          install: make mingw-w64-x86_64-gcc mingw-w64-x86_64-python curl tar
+          update: true
+      - name: Build and measure (MinGW-w64 gcc)
+        run: |
+          set -eu
+          gcc --version | head -1
+          sh tools/tools/instrument.sh base
+          sh tools/tools/instrument.sh cand
+          for d in base cand; do make -C $d -j$(nproc) zstd CC=gcc > /dev/null; done
+          cp base/zstd.exe zbase.exe && cp cand/zstd.exe zcand.exe
+          mkdir -p gc/corpus data
+          gcc -O2 -o gencorpus.exe tools/tools/gencorpus.c
+          (cd gc && ../gencorpus.exe > /dev/null)
+          curl -sSfL -o data/github.tar.zst "$GITHUB_DATA"
+          ./zcand.exe -dqf data/github.tar.zst -o data/github.tar
+          (cd data && tar -xf github.tar)
+          python tools/tools/e2e.py windows-x86_64-mingw "$PWD/zbase.exe" "$PWD/zcand.exe" "$PWD/gc" "$PWD/data"
