@@ -6,8 +6,10 @@
 # so each run reports whole-process wall time AND the sort's share of it.
 # Corpora: the synthetic generator used by cover-mkq.yml, and zstd's own
 # "github" regression dataset (500 small JSON records).
+# Each job also logs its CPU model, compiler version and the exact command line
+# that compiled cover.c (MACHINE / COMPILER / FLAGS lines).
 #
-# Triggered by a push to bench-e2e only; push once, when ready.
+# Dispatch only, once, on the final commit.
 name: cover-e2e
 
 on:
@@ -16,8 +18,6 @@ on:
       only:
         description: 'Job group to run (all, native, alpine, freebsd, mingw), to re-run one group without the rest'
         default: 'all'
-  push:
-    branches: ['bench-e2e']
 
 concurrency:
   group: cover-e2e
@@ -25,10 +25,12 @@ concurrency:
 
 env:
   GITHUB_DATA: https://github.com/facebook/zstd/releases/download/regression-data/github.tar.zst
+  BASE_SHA: 6e51a2469e6900e41fb509f36f1bac575e657ef6   # upstream dev
+  CAND_SHA: f0eecbf86a3d29d9b2a4d632017ae68daafa80bf   # cover-mkq-sort
 
 jobs:
   native:
-    if: ${{ github.event_name == 'push' || inputs.only == 'all' || inputs.only == 'native' }}
+    if: ${{ inputs.only == 'all' || inputs.only == 'native' }}
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -44,11 +46,11 @@ jobs:
           - { os: windows-11-arm,   label: windows-arm64-msvc,  win: true }
     steps:
       - uses: actions/checkout@v4
-        with: { ref: 'bench-base', path: base }
+        with: { ref: '${{ env.BASE_SHA }}', path: base }
       - uses: actions/checkout@v4
-        with: { ref: 'cover-mkq-sort', path: cand }
+        with: { ref: '${{ env.CAND_SHA }}', path: cand }
       - uses: actions/checkout@v4
-        with: { ref: 'bench-e2e', path: tools }
+        with: { ref: '${{ github.sha }}', path: tools }
       - name: Instrument both refs
         shell: bash
         run: |
@@ -58,7 +60,7 @@ jobs:
         if: ${{ !matrix.win }}
         run: |
           for d in base cand; do
-            make -C $d -j$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu) zstd
+            make -C $d -j$(getconf _NPROCESSORS_ONLN) V=1 zstd > build-$d.log 2>&1 || { tail -50 build-$d.log; exit 1; }
           done
           cp base/zstd zbase && cp cand/zstd zcand
       - name: Build both (windows, MSVC Release)
@@ -71,6 +73,51 @@ jobs:
           }
           Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe base/bld | Select-Object -First 1).FullName zbase.exe
           Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe cand/bld | Select-Object -First 1).FullName zcand.exe
+      - name: Describe machine and toolchain (unix)
+        if: ${{ !matrix.win }}
+        continue-on-error: true
+        run: |
+          if [ "$(uname)" = Darwin ]; then
+            CPU=$(sysctl -n machdep.cpu.brand_string); OS="macOS $(sw_vers -productVersion)"
+          else
+            CPU=$(lscpu | sed -n 's/^Model name: *//p' | head -1); OS=$(. /etc/os-release && echo "$PRETTY_NAME")
+          fi
+          echo "MACHINE ${{ matrix.label }} cpu=\"$CPU\" ncpu=$(getconf _NPROCESSORS_ONLN) os=\"$OS\" arch=$(uname -m)"
+          echo "COMPILER ${{ matrix.label }} $(cc --version | head -1)"
+          for d in base cand; do
+            echo "FLAGS ${{ matrix.label }} $d $(grep -m1 'dictBuilder/cover\.c' build-$d.log)"
+          done
+      - name: Describe machine and toolchain (windows)
+        if: ${{ matrix.win }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $p = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = "$($p.Name)".Trim()
+          $osn = "$($os.Caption) $($os.Version)"
+          $ncpu = [Environment]::ProcessorCount
+          "MACHINE ${{ matrix.label }} cpu=`"$cpu`" ncpu=$ncpu os=`"$osn`" arch=$env:PROCESSOR_ARCHITECTURE"
+          foreach ($d in @('base','cand')) {
+            $cc = Get-ChildItem -Recurse -Path "$d/bld/CMakeFiles" -Filter CMakeCCompiler.cmake | Select-Object -First 1
+            if ($cc) {
+              Select-String -Path $cc.FullName -Pattern 'set\(CMAKE_C_COMPILER(_ID|_VERSION)? ' |
+                ForEach-Object { "COMPILER ${{ matrix.label }} $d $($_.Line.Trim())" }
+            }
+            cmake -N -LA "$d/bld" | Select-String '^CMAKE_C_FLAGS(_RELEASE)?:' |
+              ForEach-Object { "CMAKECACHE ${{ matrix.label }} $d $_" }
+            $found = $false
+            foreach ($t in Get-ChildItem -Recurse -Path "$d/bld" -Filter 'CL.command.1.tlog') {
+              $lines = @(Get-Content $t.FullName)
+              for ($i = 0; $i -lt $lines.Count - 1; $i++) {
+                if ($lines[$i] -match 'DICTBUILDER\\COVER\.C') {
+                  "FLAGS ${{ matrix.label }} $d [$($t.Directory.Name)] $($lines[$i+1])"
+                  $found = $true
+                }
+              }
+            }
+            if (-not $found) { "FLAGS ${{ matrix.label }} $d (cover.c not found in any CL tlog)" }
+          }
       - name: Corpora
         shell: bash
         run: |
@@ -90,7 +137,7 @@ jobs:
           $PY tools/tools/e2e.py ${{ matrix.label }} "$PWD/zbase$EXT" "$PWD/zcand$EXT" "$PWD/gc" "$PWD/data"
 
   alpine:
-    if: ${{ github.event_name == 'push' || inputs.only == 'all' || inputs.only == 'alpine' }}
+    if: ${{ inputs.only == 'all' || inputs.only == 'alpine' }}
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -102,11 +149,16 @@ jobs:
           - { os: ubuntu-24.04-arm, label: linux-arm64-musl }
     steps:
       - uses: actions/checkout@v4
-        with: { ref: 'bench-base', path: base }
+        with: { ref: '${{ env.BASE_SHA }}', path: base }
       - uses: actions/checkout@v4
-        with: { ref: 'cover-mkq-sort', path: cand }
+        with: { ref: '${{ env.CAND_SHA }}', path: cand }
       - uses: actions/checkout@v4
-        with: { ref: 'bench-e2e', path: tools }
+        with: { ref: '${{ github.sha }}', path: tools }
+      - name: Describe machine
+        continue-on-error: true
+        run: |
+          CPU=$(lscpu | sed -n 's/^Model name: *//p' | head -1)
+          echo "MACHINE ${{ matrix.label }} cpu=\"$CPU\" ncpu=$(nproc) os=\"Alpine 3.22 container on $(. /etc/os-release && echo "$PRETTY_NAME")\" arch=$(uname -m)"
       - name: Build and measure in Alpine (musl)
         run: |
           docker run --rm -v "$PWD":/w -w /w -e GITHUB_DATA alpine:3.22 sh -euc '
@@ -114,7 +166,13 @@ jobs:
             echo "musl: $(ldd 2>&1 | head -2 | tail -1)"
             sh tools/tools/instrument.sh base
             sh tools/tools/instrument.sh cand
-            for d in base cand; do make -C $d -j$(nproc) zstd > /dev/null; done
+            for d in base cand; do
+              make -C $d -j$(nproc) V=1 zstd > build-$d.log 2>&1 || { tail -50 build-$d.log; exit 1; }
+            done
+            echo "COMPILER ${{ matrix.label }} $(cc --version | head -1)"
+            for d in base cand; do
+              echo "FLAGS ${{ matrix.label }} $d $(grep -m1 "dictBuilder/cover\.c" build-$d.log)"
+            done
             cp base/zstd zbase && cp cand/zstd zcand
             mkdir -p gc/corpus data
             cc -O2 -o gencorpus tools/tools/gencorpus.c
@@ -122,21 +180,26 @@ jobs:
             curl -sSfL -o data/github.tar.zst "$GITHUB_DATA"
             ./zcand -dqf data/github.tar.zst -o data/github.tar
             (cd data && tar -xf github.tar)
-            python3 tools/tools/e2e.py '"${{ matrix.label }}"' /w/zbase /w/zcand /w/gc /w/data
+            python3 tools/tools/e2e.py ${{ matrix.label }} /w/zbase /w/zcand /w/gc /w/data
           '
 
   freebsd:
-    if: ${{ github.event_name == 'push' || inputs.only == 'all' || inputs.only == 'freebsd' }}
+    if: ${{ inputs.only == 'all' || inputs.only == 'freebsd' }}
     name: freebsd-x86_64
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
-        with: { ref: 'bench-base', path: base }
+        with: { ref: '${{ env.BASE_SHA }}', path: base }
       - uses: actions/checkout@v4
-        with: { ref: 'cover-mkq-sort', path: cand }
+        with: { ref: '${{ env.CAND_SHA }}', path: cand }
       - uses: actions/checkout@v4
-        with: { ref: 'bench-e2e', path: tools }
+        with: { ref: '${{ github.sha }}', path: tools }
+      - name: Describe host
+        continue-on-error: true
+        run: |
+          CPU=$(lscpu | sed -n 's/^Model name: *//p' | head -1)
+          echo "HOST freebsd-x86_64 cpu=\"$CPU\" ncpu=$(nproc) os=\"$(. /etc/os-release && echo "$PRETTY_NAME")\" arch=$(uname -m)"
       - name: Build and measure in FreeBSD
         uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
@@ -148,10 +211,16 @@ jobs:
             pkg install -y gmake python3 curl
           run: |
             set -eu
-            freebsd-version; sysctl -n hw.model hw.ncpu
+            echo "MACHINE freebsd-x86_64 cpu=\"$(sysctl -n hw.model)\" ncpu=$(sysctl -n hw.ncpu) os=\"FreeBSD $(freebsd-version) VM\" arch=$(uname -m)"
             sh tools/tools/instrument.sh base
             sh tools/tools/instrument.sh cand
-            for d in base cand; do gmake -C $d -j$(sysctl -n hw.ncpu) zstd > /dev/null; done
+            for d in base cand; do
+              gmake -C $d -j$(sysctl -n hw.ncpu) V=1 zstd > build-$d.log 2>&1 || { tail -50 build-$d.log; exit 1; }
+            done
+            echo "COMPILER freebsd-x86_64 $(cc --version | head -1)"
+            for d in base cand; do
+              echo "FLAGS freebsd-x86_64 $d $(grep -m1 'dictBuilder/cover\.c' build-$d.log)"
+            done
             cp base/zstd zbase && cp cand/zstd zcand
             mkdir -p gc/corpus data
             cc -O2 -o gencorpus tools/tools/gencorpus.c
@@ -162,7 +231,7 @@ jobs:
             python3 tools/tools/e2e.py freebsd-x86_64 "$PWD/zbase" "$PWD/zcand" "$PWD/gc" "$PWD/data"
 
   mingw:
-    if: ${{ github.event_name == 'push' || inputs.only == 'all' || inputs.only == 'mingw' }}
+    if: ${{ inputs.only == 'all' || inputs.only == 'mingw' }}
     name: windows-x86_64-mingw
     runs-on: windows-latest
     timeout-minutes: 60
@@ -171,11 +240,21 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
-        with: { ref: 'bench-base', path: base }
+        with: { ref: '${{ env.BASE_SHA }}', path: base }
       - uses: actions/checkout@v4
-        with: { ref: 'cover-mkq-sort', path: cand }
+        with: { ref: '${{ env.CAND_SHA }}', path: cand }
       - uses: actions/checkout@v4
-        with: { ref: 'bench-e2e', path: tools }
+        with: { ref: '${{ github.sha }}', path: tools }
+      - name: Describe machine
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $p = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = "$($p.Name)".Trim()
+          $osn = "$($os.Caption) $($os.Version)"
+          $ncpu = [Environment]::ProcessorCount
+          "MACHINE windows-x86_64-mingw cpu=`"$cpu`" ncpu=$ncpu os=`"$osn`" arch=$env:PROCESSOR_ARCHITECTURE"
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # tag=v2.32.0
         with:
           msystem: MINGW64
@@ -184,10 +263,15 @@ jobs:
       - name: Build and measure (MinGW-w64 gcc)
         run: |
           set -eu
-          gcc --version | head -1
+          echo "COMPILER windows-x86_64-mingw $(gcc --version | head -1)"
           sh tools/tools/instrument.sh base
           sh tools/tools/instrument.sh cand
-          for d in base cand; do make -C $d -j$(nproc) zstd CC=gcc > /dev/null; done
+          for d in base cand; do
+            make -C $d -j$(nproc) V=1 zstd CC=gcc > build-$d.log 2>&1 || { tail -50 build-$d.log; exit 1; }
+          done
+          for d in base cand; do
+            echo "FLAGS windows-x86_64-mingw $d $(grep -m1 'dictBuilder/cover\.c' build-$d.log)"
+          done
           cp base/zstd.exe zbase.exe && cp cand/zstd.exe zcand.exe
           mkdir -p gc/corpus data
           gcc -O2 -o gencorpus.exe tools/tools/gencorpus.c

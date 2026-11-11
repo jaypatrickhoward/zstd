@@ -1,5 +1,6 @@
-# PR2 validation: multi-key quicksort vs qsort + the merged #4765 comparator.
-# Base is branch bench-base, a copy of upstream dev at the commit PR2 is rebased on.
+# PR2 validation: multi-key quicksort vs upstream dev's qsort().
+# Base is upstream dev at the commit PR2 is rebased on; the candidate is the PR2
+# head. Both are pinned by SHA so the run measures exactly what gets filed.
 #
 # NOT part of any PR. Two claims, measured separately:
 #   correctness - dictionaries must be byte-identical, on every platform
@@ -8,14 +9,18 @@
 #
 # stableSort() is wrapped with a clock() hook by tools/instrument.sh, applied
 # identically to both refs so neither branch carries benchmark code.
+# Each native job also logs its CPU model, compiler version and the exact
+# command line that compiled cover.c (MACHINE / COMPILER / FLAGS lines).
 # QEMU targets run correctness only: emulation does not model caches, so its
 # timings would not mean anything.
 name: cover-mkq
 
 on:
   workflow_dispatch:
-  push:
-    branches: ['bench-mkq']
+
+env:
+  BASE_SHA: 6e51a2469e6900e41fb509f36f1bac575e657ef6   # upstream dev
+  CAND_SHA: f0eecbf86a3d29d9b2a4d632017ae68daafa80bf   # cover-mkq-sort
 
 jobs:
   native:
@@ -34,11 +39,11 @@ jobs:
           - { os: windows-11-arm,   label: windows-arm64,  win: true  }
     steps:
       - uses: actions/checkout@v4
-        with: { ref: 'bench-base', path: base }
+        with: { ref: '${{ env.BASE_SHA }}', path: base }
       - uses: actions/checkout@v4
-        with: { ref: 'cover-mkq-sort', path: cand }
+        with: { ref: '${{ env.CAND_SHA }}', path: cand }
       - uses: actions/checkout@v4
-        with: { ref: 'bench-mkq', path: tools }
+        with: { ref: '${{ github.sha }}', path: tools }
 
       - name: Instrument both refs
         shell: bash
@@ -50,10 +55,9 @@ jobs:
         if: ${{ !matrix.win }}
         run: |
           for d in base cand; do
-            make -C $d -j$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu) zstd
+            make -C $d -j$(getconf _NPROCESSORS_ONLN) V=1 zstd > build-$d.log 2>&1 || { tail -50 build-$d.log; exit 1; }
           done
           cp base/zstd zbase && cp cand/zstd zcand
-          echo "--- flags actually used ---"; make -C base -n zstd | grep -m1 -oE '\-O[0-9s]' || true
 
       - name: Build both (windows, MSVC Release)
         if: ${{ matrix.win }}
@@ -65,6 +69,53 @@ jobs:
           }
           Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe base/bld | Select-Object -First 1).FullName zbase.exe
           Copy-Item (Get-ChildItem -Recurse -Filter zstd.exe cand/bld | Select-Object -First 1).FullName zcand.exe
+
+      - name: Describe machine and toolchain (unix)
+        if: ${{ !matrix.win }}
+        continue-on-error: true
+        run: |
+          if [ "$(uname)" = Darwin ]; then
+            CPU=$(sysctl -n machdep.cpu.brand_string); OS="macOS $(sw_vers -productVersion)"
+          else
+            CPU=$(lscpu | sed -n 's/^Model name: *//p' | head -1); OS=$(. /etc/os-release && echo "$PRETTY_NAME")
+          fi
+          echo "MACHINE ${{ matrix.label }} cpu=\"$CPU\" ncpu=$(getconf _NPROCESSORS_ONLN) os=\"$OS\" arch=$(uname -m)"
+          echo "COMPILER ${{ matrix.label }} $(cc --version | head -1)"
+          for d in base cand; do
+            echo "FLAGS ${{ matrix.label }} $d $(grep -m1 'dictBuilder/cover\.c' build-$d.log)"
+          done
+
+      - name: Describe machine and toolchain (windows)
+        if: ${{ matrix.win }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $p = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = "$($p.Name)".Trim()
+          $osn = "$($os.Caption) $($os.Version)"
+          $ncpu = [Environment]::ProcessorCount
+          "MACHINE ${{ matrix.label }} cpu=`"$cpu`" ncpu=$ncpu os=`"$osn`" arch=$env:PROCESSOR_ARCHITECTURE"
+          foreach ($d in @('base','cand')) {
+            $cc = Get-ChildItem -Recurse -Path "$d/bld/CMakeFiles" -Filter CMakeCCompiler.cmake | Select-Object -First 1
+            if ($cc) {
+              Select-String -Path $cc.FullName -Pattern 'set\(CMAKE_C_COMPILER(_ID|_VERSION)? ' |
+                ForEach-Object { "COMPILER ${{ matrix.label }} $d $($_.Line.Trim())" }
+            }
+            cmake -N -LA "$d/bld" | Select-String '^CMAKE_C_FLAGS(_RELEASE)?:' |
+              ForEach-Object { "CMAKECACHE ${{ matrix.label }} $d $_" }
+            $found = $false
+            foreach ($t in Get-ChildItem -Recurse -Path "$d/bld" -Filter 'CL.command.1.tlog') {
+              $lines = @(Get-Content $t.FullName)
+              for ($i = 0; $i -lt $lines.Count - 1; $i++) {
+                if ($lines[$i] -match 'DICTBUILDER\\COVER\.C') {
+                  "FLAGS ${{ matrix.label }} $d [$($t.Directory.Name)] $($lines[$i+1])"
+                  $found = $true
+                }
+              }
+            }
+            if (-not $found) { "FLAGS ${{ matrix.label }} $d (cover.c not found in any CL tlog)" }
+          }
 
       - name: Generate corpus
         shell: bash
@@ -113,7 +164,7 @@ jobs:
   qemu:
     name: qemu-${{ matrix.name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -130,12 +181,13 @@ jobs:
         ]
     steps:
       - uses: actions/checkout@v4
-        with: { ref: 'bench-base', path: base }
+        with: { ref: '${{ env.BASE_SHA }}', path: base }
       - uses: actions/checkout@v4
-        with: { ref: 'cover-mkq-sort', path: cand }
+        with: { ref: '${{ env.CAND_SHA }}', path: cand }
       - uses: actions/checkout@v4
-        with: { ref: 'bench-mkq', path: tools }
+        with: { ref: '${{ github.sha }}', path: tools }
       - name: Install toolchain
+        timeout-minutes: 10   # fail fast if the apt mirror is unreachable
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.xcc_pkg }} ${{ matrix.xemu_pkg }}
