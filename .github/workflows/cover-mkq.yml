@@ -1,4 +1,5 @@
-# PR2 validation: multi-key quicksort vs (qsort + PR1 comparator).
+# PR2 validation: multi-key quicksort vs qsort + the merged #4765 comparator.
+# Base is branch bench-base, a copy of upstream dev at the commit PR2 is rebased on.
 #
 # NOT part of any PR. Two claims, measured separately:
 #   correctness - dictionaries must be byte-identical, on every platform
@@ -33,7 +34,7 @@ jobs:
           - { os: windows-11-arm,   label: windows-arm64,  win: true  }
     steps:
       - uses: actions/checkout@v4
-        with: { ref: 'cover-cmp-fix', path: base }
+        with: { ref: 'bench-base', path: base }
       - uses: actions/checkout@v4
         with: { ref: 'cover-mkq-sort', path: cand }
       - uses: actions/checkout@v4
@@ -129,7 +130,7 @@ jobs:
         ]
     steps:
       - uses: actions/checkout@v4
-        with: { ref: 'cover-cmp-fix', path: base }
+        with: { ref: 'bench-base', path: base }
       - uses: actions/checkout@v4
         with: { ref: 'cover-mkq-sort', path: cand }
       - uses: actions/checkout@v4
